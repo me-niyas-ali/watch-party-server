@@ -1,121 +1,168 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>Video Watch Party</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
-    #room-selection, #controls { margin-bottom: 20px; }
-    #video-container { margin-top: 20px; }
-    video { width: 80%; max-width: 700px; }
-    button { margin-right: 10px; padding: 10px; }
-  </style>
+<meta charset="UTF-8">
+<title>P2P Watch Party</title>
+<style>
+  body { font-family: Arial; padding: 20px; background: #f0f0f0; }
+  #controls, #upload-container { margin-top: 10px; }
+  video { width: 80%; max-width: 700px; background: black; }
+  button { margin-right: 10px; padding: 10px; }
+</style>
 </head>
 <body>
-  <h1>Watch Party</h1>
+<h1>P2P Watch Party</h1>
 
-  <div id="room-selection">
-    <button id="hostBtn">Host</button>
-    <button id="joinBtn">Join</button>
-    <input type="text" id="roomInput" placeholder="Enter room code" style="display:none"/>
-    <button id="joinRoomBtn" style="display:none">Join Room</button>
-  </div>
+<div id="room-selection">
+  <button id="hostBtn">Host</button>
+  <button id="joinBtn">Join</button>
+  <input type="text" id="roomInput" placeholder="Enter room code" style="display:none"/>
+  <button id="joinRoomBtn" style="display:none">Join Room</button>
+</div>
 
-  <div id="status">Not connected</div>
-  <div>Total Connected: <span id="total">0</span></div>
+<div id="status">Not connected</div>
+<div>Total Connected: <span id="total">0</span></div>
 
-  <div id="upload-container" style="display:none">
-    <input type="file" id="videoFile"/>
-  </div>
+<div id="upload-container" style="display:none">
+  <input type="file" id="videoFile"/>
+</div>
 
-  <div id="video-container">
-    <video id="video" controls></video>
-  </div>
+<div id="video-container">
+  <video id="video" controls autoplay muted></video>
+</div>
 
-  <div id="controls" style="display:none">
-    <button id="playBtn">Play</button>
-    <button id="pauseBtn">Pause</button>
-  </div>
+<div id="controls" style="display:none">
+  <button id="playBtn">Play</button>
+  <button id="pauseBtn">Pause</button>
+</div>
 
-  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
-  <script>
-    const socket = io(); // Connects to server
-    let room = '';
-    let isHost = false;
-    let video = document.getElementById('video');
+<script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+<script>
+const socket = io(); // Connect to server
+let room = '';
+let isHost = false;
+let peers = {}; // peerID -> RTCPeerConnection
+const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+const video = document.getElementById('video');
+let localStream = null;
 
-    // Room selection
-    document.getElementById('hostBtn').onclick = () => {
-      isHost = true;
-      room = Math.floor(1000 + Math.random() * 9000).toString();
-      alert("Your room code: " + room);
-      socket.emit('joinRoom', room);
-      afterJoin();
+// Room selection
+document.getElementById('hostBtn').onclick = async () => {
+  isHost = true;
+  room = Math.floor(1000 + Math.random() * 9000).toString();
+  alert("Your room code: " + room);
+  socket.emit('joinRoom', room);
+  afterJoin();
+}
+
+document.getElementById('joinBtn').onclick = () => {
+  document.getElementById('roomInput').style.display = 'inline';
+  document.getElementById('joinRoomBtn').style.display = 'inline';
+}
+
+document.getElementById('joinRoomBtn').onclick = () => {
+  room = document.getElementById('roomInput').value;
+  if(room.length !== 4){ alert('Enter 4-digit room code'); return; }
+  socket.emit('joinRoom', room);
+  afterJoin();
+}
+
+function afterJoin(){
+  document.getElementById('status').innerText = 'Connected to server';
+  document.getElementById('upload-container').style.display = 'block';
+  document.getElementById('controls').style.display = 'block';
+}
+
+// Update connected count
+socket.on('updateCount', count => {
+  document.getElementById('total').innerText = count;
+});
+
+// =================== HOST VIDEO STREAM ===================
+document.getElementById('videoFile').onchange = async (e) => {
+  if(!isHost) return alert("Only host can upload video!");
+  const file = e.target.files[0];
+  if(!file) return;
+  const url = URL.createObjectURL(file);
+  video.src = url;
+
+  // Convert video to stream for WebRTC
+  localStream = video.captureStream();
+  console.log('Captured stream for P2P', localStream);
+
+  // Notify server host ready
+  socket.emit('hostReady', room);
+}
+
+// Play/Pause sync
+document.getElementById('playBtn').onclick = () => {
+  video.play();
+  socket.emit('play', { room });
+}
+document.getElementById('pauseBtn').onclick = () => {
+  video.pause();
+  socket.emit('pause', { room });
+}
+
+socket.on('play', () => video.play());
+socket.on('pause', () => video.pause());
+
+// =================== WEBRTC SIGNALING ===================
+socket.on('allUsers', users => {
+  users.forEach(async userID => {
+    await createPeer(userID, true);
+  });
+});
+
+socket.on('offer', async payload => {
+  const peer = await createPeer(payload.callerID, false);
+  await peer.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+  const answer = await peer.createAnswer();
+  await peer.setLocalDescription(answer);
+  socket.emit('answer', { target: payload.callerID, sdp: peer.localDescription });
+});
+
+socket.on('answer', async payload => {
+  const peer = peers[payload.callerID];
+  await peer.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+});
+
+socket.on('ice-candidate', async payload => {
+  const peer = peers[payload.id];
+  if(peer) await peer.addIceCandidate(payload.candidate);
+});
+
+async function createPeer(userID, initiator){
+  const peer = new RTCPeerConnection(config);
+  peers[userID] = peer;
+
+  if(isHost && localStream){
+    localStream.getTracks().forEach(track => peer.addTrack(track, localStream));
+  }
+
+  if(!isHost){
+    peer.ontrack = e => {
+      video.srcObject = e.streams[0];
     }
+  }
 
-    document.getElementById('joinBtn').onclick = () => {
-      document.getElementById('roomInput').style.display = 'inline';
-      document.getElementById('joinRoomBtn').style.display = 'inline';
+  peer.onicecandidate = event => {
+    if(event.candidate){
+      socket.emit('ice-candidate', { target: userID, candidate: event.candidate });
     }
+  }
 
-    document.getElementById('joinRoomBtn').onclick = () => {
-      room = document.getElementById('roomInput').value;
-      if(room.length !== 4){ alert('Enter 4-digit room code'); return; }
-      socket.emit('joinRoom', room);
-      afterJoin();
-    }
+  if(initiator){
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    socket.emit('offer', { target: userID, sdp: peer.localDescription });
+  }
 
-    function afterJoin(){
-      document.getElementById('status').innerText = 'Connected to server';
-      document.getElementById('upload-container').style.display = 'block';
-      document.getElementById('controls').style.display = 'block';
-    }
+  return peer;
+}
 
-    // Update connected count
-    socket.on('updateCount', count => {
-      document.getElementById('total').innerText = count;
-    });
-
-    // Video sync events
-    document.getElementById('playBtn').onclick = () => {
-      video.play();
-      socket.emit('play', { room });
-    }
-
-    document.getElementById('pauseBtn').onclick = () => {
-      video.pause();
-      socket.emit('pause', { room });
-    }
-
-    socket.on('play', () => video.play());
-    socket.on('pause', () => video.pause());
-
-    // Video upload (host only)
-    document.getElementById('videoFile').onchange = async (e) => {
-      if(!isHost) return alert("Only host can upload video!");
-      const file = e.target.files[0];
-      if(!file) return;
-      const url = URL.createObjectURL(file);
-      video.src = url;
-      socket.emit('videoURL', { room, url });
-    }
-
-    // Update video for joining users
-    socket.on('videoURL', data => {
-      video.src = data.url;
-    });
-
-    // Sync time every 5 seconds
-    setInterval(() => {
-      if(isHost && !video.paused){
-        socket.emit('timeSync', { room, time: video.currentTime });
-      }
-    }, 5000);
-
-    socket.on('timeSync', data => {
-      if(!isHost) video.currentTime = data.time;
-    });
-  </script>
+// =================== SOCKET SERVER CONNECTION ===================
+socket.on('connect', () => console.log('Connected to signaling server'));
+</script>
 </body>
 </html>
