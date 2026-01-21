@@ -1,86 +1,41 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const cors = require("cors");
+// server.js
+const WebSocket = require('ws');
+const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
 
-const app = express();
-const server = http.createServer(app);
+const rooms = {}; // { roomCode: Set of clients }
 
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+wss.on('connection', ws => {
+  ws.roomCode = null;
+
+  ws.on('message', msg => {
+    const data = JSON.parse(msg);
+
+    if (data.type === 'join') {
+      const code = data.room;
+      ws.roomCode = code;
+      if (!rooms[code]) rooms[code] = new Set();
+      rooms[code].add(ws);
+
+      const count = rooms[code].size;
+      rooms[code].forEach(c => c.send(JSON.stringify({ type: 'count', count })));
+    }
+    else if (['offer','answer','candidate'].includes(data.type)) {
+      const code = ws.roomCode;
+      if (!rooms[code]) return;
+      rooms[code].forEach(c => {
+        if (c !== ws) c.send(JSON.stringify(data));
+      });
+    }
+  });
+
+  ws.on('close', () => {
+    if (ws.roomCode && rooms[ws.roomCode]) {
+      rooms[ws.roomCode].delete(ws);
+      const count = rooms[ws.roomCode].size;
+      rooms[ws.roomCode].forEach(c => c.send(JSON.stringify({ type: 'count', count })));
+      if (rooms[ws.roomCode].size === 0) delete rooms[ws.roomCode];
+    }
+  });
 });
 
-const rooms = {};
-
-io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
-
-  socket.on("join-room", (roomId) => {
-    const room = rooms[roomId] || { host: null, peers: new Set() };
-
-    if (!room.host) {
-      room.host = socket.id;
-      console.log(`Room ${roomId} - Assigned host: ${socket.id}`);
-    }
-
-    room.peers.add(socket.id);
-    rooms[roomId] = room;
-    socket.join(roomId);
-
-    const isHost = socket.id === room.host;
-    socket.emit("joined", { roomId, isHost });
-    io.to(roomId).emit("peer-count", room.peers.size);
-  });
-
-  socket.on("leave-room", (roomId) => {
-    leaveRoom(socket, roomId);
-    socket.emit("left-room");
-  });
-
-  socket.on("disconnect", () => {
-    for (const roomId in rooms) {
-      leaveRoom(socket, roomId);
-    }
-    console.log("Client disconnected:", socket.id);
-  });
-
-  socket.on("video-chunk", ({ roomId, chunk }) => {
-    socket.to(roomId).emit("receive-chunk", chunk);
-    console.log(`Chunk sent to peers in room ${roomId}`);
-  });
-
-  socket.on("video-size", ({ roomId, size }) => {
-    socket.to(roomId).emit("video-size", { size });
-    console.log(`Video size ${size} sent to peers in room ${roomId}`);
-  });
-
-  socket.on("video-control", ({ roomId, action, time }) => {
-    socket.to(roomId).emit("video-control", { action, time });
-    console.log(`Video ${action} at ${time}s in room ${roomId}`);
-  });
-
-  function leaveRoom(socket, roomId) {
-    const room = rooms[roomId];
-    if (!room) return;
-
-    room.peers.delete(socket.id);
-    if (room.host === socket.id) {
-      console.log(`Host left room ${roomId}`);
-      io.to(roomId).emit("left-room");
-      delete rooms[roomId];
-    } else {
-      io.to(roomId).emit("peer-count", room.peers.size);
-      console.log(`Peer ${socket.id} left room ${roomId}`);
-    }
-
-    socket.leave(roomId);
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+console.log('WebSocket signaling server running...');
