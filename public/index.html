@@ -1,145 +1,129 @@
-import express from "express";
-import http from "http";
-import WebSocket, { WebSocketServer } from "ws";
-import cors from "cors";
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Watch Party Streaming</title>
+<style>
+body { background:#111; color:#eee; font-family:system-ui; padding:20px }
+video { width:100%; max-width:900px; background:black }
+.box { margin-top:16px }
+input, button { padding:8px; margin-top:8px }
+code { background:#222; padding:4px 6px }
+</style>
+</head>
+<body>
+<h1>🎬 Watch Party Streaming</h1>
 
-const app = express();
-app.use(cors()); // Enable CORS for all origins
+<div class="box">
+  <strong>Select Role:</strong><br>
+  <button onclick="selectRole('host')">Host</button>
+  <button onclick="selectRole('guest')">Join</button>
+</div>
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+<div id="hostOptions" class="box" style="display:none;">
+  <strong>Select Video to Stream:</strong><br>
+  <input type="file" id="fileInput" accept="video/*"><br>
+  <strong>Room Code:</strong> <code id="roomCode">(generating…)</code><br>
+  <strong>Total Connected Devices:</strong> <span id="count">1</span>
+</div>
 
-const rooms = new Map(); // roomId => Set of clients
+<div id="guestOptions" class="box" style="display:none;">
+  <strong>Enter Room Code:</strong><br>
+  <input id="joinCode" placeholder="6-digit room code">
+  <button onclick="joinRoom()">Join</button>
+  <br><strong>Total Connected Devices:</strong> <span id="countGuest">1</span>
+</div>
 
-function broadcastToRoom(roomId, data, excludeSocket = null) {
-  const clients = rooms.get(roomId);
-  if (!clients) return;
-  for (const client of clients) {
-    if (client !== excludeSocket && client.readyState === WebSocket.OPEN) {
-      client.send(data);
+<video id="video" controls autoplay muted></video>
+
+<script>
+let role, ws, pc, roomCode;
+const video = document.getElementById('video');
+const roomCodeEl = document.getElementById('roomCode');
+const countEl = document.getElementById('count');
+const countGuestEl = document.getElementById('countGuest');
+
+function selectRole(selectedRole){
+  role = selectedRole;
+  document.getElementById('hostOptions').style.display = role==='host'?'block':'none';
+  document.getElementById('guestOptions').style.display = role==='guest'?'block':'none';
+
+  ws = new WebSocket('ws://localhost:3000');
+
+  ws.onmessage = msg=>{
+    const data = JSON.parse(msg.data);
+    if(data.type==='offer' && role==='guest') handleOffer(data);
+    if(data.type==='answer' && role==='host') handleAnswer(data);
+    if(data.type==='candidate') handleCandidate(data);
+    if(data.type==='count'){
+      if(role==='host') countEl.textContent = data.count;
+      else countGuestEl.textContent = data.count;
     }
+  }
+
+  if(role==='host'){
+    roomCode = Math.floor(100000 + Math.random()*900000).toString();
+    roomCodeEl.textContent = roomCode;
   }
 }
 
-wss.on("connection", (ws) => {
-  ws.isAlive = true;
-  ws.on("pong", () => { ws.isAlive = true; });
+// -------------------- Host --------------------
+document.getElementById('fileInput').addEventListener('change', async e=>{
+  const file = e.target.files[0];
+  if(!file) return;
+  video.src = URL.createObjectURL(file);
+  await video.play();
+  
+  // Capture stream
+  const stream = video.captureStream();
 
-  ws.roomId = null;
-  ws.isHost = false;
+  pc = new RTCPeerConnection();
+  stream.getTracks().forEach(track=>pc.addTrack(track, stream));
 
-  ws.on("message", (message) => {
-    let msg;
-    try {
-      msg = JSON.parse(message);
-    } catch {
-      console.warn("Invalid JSON message");
-      return;
-    }
+  pc.onicecandidate = e=>{
+    if(e.candidate) ws.send(JSON.stringify({type:'candidate', candidate:e.candidate}));
+  }
 
-    if (msg.type === "join") {
-      const roomId = msg.room;
-      ws.roomId = roomId;
-
-      if (!rooms.has(roomId)) {
-        rooms.set(roomId, new Set());
-      }
-      const clients = rooms.get(roomId);
-
-      ws.isHost = clients.size === 0; // first client is host
-      clients.add(ws);
-
-      // Notify client of init data
-      ws.send(JSON.stringify({
-        type: "init",
-        isHost: ws.isHost,
-        clients: clients.size
-      }));
-
-      // Notify all clients about current clients count
-      broadcastToRoom(roomId, JSON.stringify({
-        type: "clients",
-        count: clients.size
-      }));
-    }
-
-    else if (msg.type === "signal") {
-      // Forward signaling to target client
-      const clients = rooms.get(ws.roomId);
-      if (!clients) return;
-      for (const client of clients) {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          if (msg.to === client.id || !msg.to) { // msg.to can be undefined or target id if you implement ids
-            // We don’t assign client ids here, so send to all except sender
-            client.send(JSON.stringify({
-              type: "signal",
-              from: ws.id,
-              signal: msg.signal
-            }));
-          }
-        }
-      }
-    }
-
-    else if (msg.type === "playback") {
-      // Broadcast playback control to all except sender
-      broadcastToRoom(ws.roomId, JSON.stringify({
-        type: "playback",
-        action: msg.action,
-        time: msg.time
-      }), ws);
-    }
-  });
-
-  ws.on("close", () => {
-    const roomId = ws.roomId;
-    if (!roomId) return;
-
-    const clients = rooms.get(roomId);
-    if (!clients) return;
-
-    clients.delete(ws);
-
-    // If room empty, delete it
-    if (clients.size === 0) {
-      rooms.delete(roomId);
-    } else {
-      // If host disconnected, assign new host (first in set)
-      if (ws.isHost) {
-        const newHost = clients.values().next().value;
-        if (newHost) {
-          newHost.isHost = true;
-          newHost.send(JSON.stringify({
-            type: "init",
-            isHost: true,
-            clients: clients.size
-          }));
-        }
-      }
-      // Broadcast updated client count
-      broadcastToRoom(roomId, JSON.stringify({
-        type: "clients",
-        count: clients.size
-      }));
-    }
-  });
-
-  // Optional: Ping/pong to detect dead connections
-  const interval = setInterval(() => {
-    if (ws.isAlive === false) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  }, 30000);
-
-  ws.on("close", () => clearInterval(interval));
+  // Wait for guests to join: host waits for signaling offers from guests
 });
 
-// Optional health check endpoint
-app.get("/", (req, res) => {
-  res.send("WebSocket signaling server is running.");
-});
+function handleAnswer(data){
+  pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+}
 
-const port = process.env.PORT || 3000;
-server.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
-});
+function handleCandidate(data){
+  if(pc) pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+}
+
+// -------------------- Guest --------------------
+async function joinRoom(){
+  roomCode = document.getElementById('joinCode').value.trim();
+  if(!roomCode) return;
+
+  pc = new RTCPeerConnection();
+  pc.ontrack = e=>{
+    video.srcObject = e.streams[0];
+  }
+  pc.onicecandidate = e=>{
+    if(e.candidate) ws.send(JSON.stringify({type:'candidate', candidate:e.candidate}));
+  }
+
+  // Notify server to join room
+  ws.onopen = ()=>ws.send(JSON.stringify({type:'join', room:roomCode}));
+
+  // Guest creates offer
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  ws.send(JSON.stringify({type:'offer', offer, room:roomCode}));
+}
+
+async function handleOffer(data){
+  await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  ws.send(JSON.stringify({type:'answer', answer, room:roomCode}));
+}
+
+</script>
+</body>
+</html>
